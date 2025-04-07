@@ -1,0 +1,2 @@
+add_executable(gatebootstrapping_test gatebootstrapping.cu)
+target_link_libraries(gatebootstrapping_test cutfhe++)

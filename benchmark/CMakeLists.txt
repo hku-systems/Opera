@@ -1,0 +1,7 @@
+add_subdirectory(tpch_q1)
+# add_subdirectory(tpch_q4)
+add_subdirectory(tpch_q6)
+# add_subdirectory(tpch_q12)
+# add_subdirectory(tpch_q15)
+# add_subdirectory(tpch_q17)
+# add_subdirectory(tpch_q19)

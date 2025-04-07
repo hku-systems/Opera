@@ -1,0 +1,5 @@
+add_subdirectory(fft)
+# add_subdirectory(msbgatebootstrapping)
+# add_subdirectory(comparison)
+add_subdirectory(keyswitch)
+add_subdirectory(gatebootstrapping)

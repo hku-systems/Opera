@@ -1,0 +1,19 @@
+version: '3'
+
+services:
+  opera:
+    build: ./
+    container_name: opera
+    deploy:
+      resources:
+        reservations:
+          devices:
+          - driver: nvidia
+            device_ids: ['all']
+            capabilities: [gpu]
+    cap_add:
+      - SYS_ADMIN
+    volumes:
+      - .:/app/
+    stdin_open: true
+    tty: true

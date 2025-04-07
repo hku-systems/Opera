@@ -1,0 +1,2 @@
+add_executable(msbgatebootstrapping_test msbgatebootstrapping.cu)
+target_link_libraries(msbgatebootstrapping_test opera cutfhe++ OpenMP::OpenMP_CXX)
