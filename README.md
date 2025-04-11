@@ -36,23 +36,24 @@ Then, build the project in the container:
 ```
 docker exec -it opera /bin/bash
 /# cd app
-/app# cmake -B ./build -DCMAKE_CUDA_ARCHITECTURES=86 && make -C build -j
+/app# cmake -B ./build -DCMAKE_CUDA_ARCHITECTURES=80 && make -C build -j
 ```
 
 The executable will be generated in the `build/bin` directory of the project.
 
 ## Benchmarks
 
-The benchmark executable is also located in the `build/bin` directory.
+The benchmark can be built with option: `-D OPERA_BUILD_BENCHMARKS=ON`,
+and the executable will be located in the `build/bin` directory.
 
 Available benchmarks:
 - `tpch_q1`: TPC-H Query 1
-- `tpch_q4`: TPC-H Query 4 (Coming soon)
+- `tpch_q4`: TPC-H Query 4
 - `tpch_q6`: TPC-H Query 6
-- `tpch_q12`: TPC-H Query 12 (Coming soon)
-- `tpch_q15`: TPC-H Query 15 (Coming soon)
-- `tpch_q17`: TPC-H Query 17 (Coming soon)
-- `tpch_q19`: TPC-H Query 19 (Coming soon)
+- `tpch_q12`: TPC-H Query 12
+- `tpch_q15`: TPC-H Query 15
+- `tpch_q17`: TPC-H Query 17
+- `tpch_q19`: TPC-H Query 19
 
 To check the usage of the benchmark, run the executable with the `--help` option.
 

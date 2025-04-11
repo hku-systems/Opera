@@ -610,15 +610,7 @@ void query_evaluation(TFHESecretKey &sk, TFHEEvalKey &ek, size_t rows, std::vect
     conversion(results, pred_cres, pred_res, rlwe, sk, conversion_time, NOCHECK);
     rlwe.genGaloisKeys();
     aggregation(results, pred_res, data, rows, rlwe, aggregation_time);
-    cout << "End-to-End Time: "
-         << (filter_time + conversion_time + aggregation_time) / 1000 << " s"
-         << endl;
-
-    time.push_back(rows);
-    time.push_back(filter_time/1000);
-    time.push_back(conversion_time/1000);
-    time.push_back(aggregation_time/1000);
-    time.push_back((filter_time+conversion_time+aggregation_time)/1000);
+    record_e2e_time(time, rows, filter_time, conversion_time, aggregation_time);
     return;
   }
 
@@ -651,51 +643,15 @@ void query_evaluation(TFHESecretKey &sk, TFHEEvalKey &ek, size_t rows, std::vect
                   ckks_correction_time, NOCHECK);
 
   aggregation(results, pred_res, data, rows, rlwe, aggregation_time);
- cout << "End-to-End Time: "
-       << (filter_time + tfhe_correction_time + conversion_time + ckks_correction_time + aggregation_time) / 1000 << " s"
-       << endl;
-  time.push_back(rows);
-  time.push_back((filter_time+tfhe_correction_time+ckks_correction_time)/1000);
-  time.push_back(filter_time/1000);
-  time.push_back(tfhe_correction_time/1000);
-  time.push_back(ckks_correction_time/1000);
-  time.push_back(conversion_time/1000);
-  time.push_back(aggregation_time/1000);
-  time.push_back((filter_time+tfhe_correction_time+ckks_correction_time+conversion_time+aggregation_time)/1000);
+
+  record_e2e_time_cache(time, rows, filter_time, tfhe_correction_time, conversion_time, ckks_correction_time, aggregation_time);
 }
 
 int main(int argc, char** argv)
 {
   argparse::ArgumentParser program("tpch_q6");
 
-  program.add_argument("--nofastcomp")
-    .help("disable fastcomp")
-    .default_value(false)
-    .implicit_value(true);
-
-  program.add_argument("--nocache")
-    .help("disable cache")
-    .default_value(false)
-    .implicit_value(true);
-
-  program.add_argument("--check")
-    .help("check result")
-    .default_value(false)
-    .implicit_value(true);
-
-  program.add_argument("-o", "--output")
-    .help("output file")
-    .default_value(std::string(""));
-
-  program.add_argument("--rows")
-    .help("number of rows")
-    .nargs(1,10)
-    .scan<'i', int>();
-
-  program.add_argument("-d", "--device")
-    .help("device id")
-    .default_value(0)
-    .scan<'i', int>();
+  add_arguments(program);
 
   try {
     program.parse_args(argc, argv);
@@ -726,28 +682,5 @@ int main(int argc, char** argv)
     phantom::util::global_pool()->Release();
   }
 
-  string output_head = CACHE_ENABLED ?
-    "rows,fhc,phc,lwe_correct,rlwe_correct,packing,aggregation,end2end" :
-    "rows,filter,packing,aggregation,end2end";
-
-  if (output.empty()) {
-    cout << "--------------------------------" << endl;
-    cout << output_head << endl;
-    for (size_t i = 0; i < time.size(); i++) {
-      for (size_t j = 0; j < time[i].size(); j++) {
-        cout << time[i][j] << ",";
-      }
-      cout << endl;
-    }
-  }
-  else {
-    ofstream ofs(output);
-    ofs << output_head << endl;
-    for (size_t i = 0; i < time.size(); i++) {
-      for (size_t j = 0; j < time[i].size(); j++) {
-        ofs << time[i][j] << ",";
-      }
-      ofs << endl;
-    }
-  }
+  output_result(output, time, CACHE_ENABLED);
 }

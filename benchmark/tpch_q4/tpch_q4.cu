@@ -2,7 +2,7 @@
 #include <phantom.h>
 #include <chrono>
 #include <thread>
-#include "data_q1.h"
+#include "data_q4.h"
 
 using namespace cuTFHEpp;
 using namespace opera;
@@ -13,26 +13,31 @@ bool CACHE_ENABLED = true;
 bool NOCHECK = true;
 
 /***
- * TPC-H Query 1 modified
-  select
-      l_returnflag,
-      l_linestatus,
-      sum(l_quantity) as sum_qty,
-      sum(l_extendedprice) as sum_base_price,
-      sum(l_extendedprice * (1 - l_discount)) as sum_disc_price,
-      sum(l_extendedprice * (1 - l_discount) * (1 + l_tax)) as sum_charge,
-      sum(l_discount) as sum_disc,
-      count(*) as count_order
+ * TPC-H Query 4 modified
+ select
+    o_orderpriority,
+    count(*) as order_count
   from
-      lineitem
+    orders
   where
-      l_shipdate <= date '1998-12-01' - interval '120' day
+    o_orderdate >= date '1996-07-01'
+    and o_orderdate < date '1996-07-01' + interval '3' month
+    and exists (
+      select
+        *
+      from
+        lineitem
+      where
+        l_orderkey = o_orderkey
+        and l_commitdate < l_receiptdate
+    )
   group by
-      l_returnflag,
-      l_linestatus
+    o_orderpriority
 
-    consider data encode by [yyyymmdd], 23 bits,
-    group by $m$ types of l_returnflag, $n$ types of l_linestatus
+    consider data encode by [yyyymmdd], 26 bits,
+    group by $m$ types of o_orderpriority,
+    l_orderkey and o_orderkey are in plaintext, so the exists part
+    can be convert into a predicate `l_commitdate < l_receiptdate`
 */
 
 void predicate_evaluation(std::vector<std::vector<TLWELvl1>> &pred_cres,
@@ -54,19 +59,24 @@ void predicate_evaluation(std::vector<std::vector<TLWELvl1>> &pred_cres,
 
   // Encrypt database
   std::cout << "Encrypting Database..." << std::endl;
-  std::vector<TLWELvl1> returnflag_ciphers(rows), linestatus_ciphers(rows);
-  std::vector<TLWELvl2> ship_ciphers(rows);
+  std::vector<TLWELvl2> orderdate_ciphers(rows), commitdate_ciphers(rows),
+      receiptdate_ciphers(rows);
+  std::vector<TLWELvl1> orderpriority_ciphers(rows);
   for (size_t i = 0; i < rows; i++) {
     auto row_data = data[i];
-    returnflag_ciphers[i] = TFHEpp::tlweSymInt32Encrypt<Lvl1>(
-        row_data.returnflag().value, Lvl1::α,
-        pow(2., row_data.returnflag().scale_bits<Lvl1>()), sk.key.get<Lvl1>());
-    linestatus_ciphers[i] = TFHEpp::tlweSymInt32Encrypt<Lvl1>(
-        row_data.linestatus().value, Lvl1::α,
-        pow(2., row_data.linestatus().scale_bits<Lvl1>()), sk.key.get<Lvl1>());
-    ship_ciphers[i] = TFHEpp::tlweSymInt32Encrypt<Lvl2>(
-        row_data.shipdate().value, Lvl2::α,
-        pow(2., row_data.shipdate().scale_bits<Lvl2>()), sk.key.get<Lvl2>());
+    orderdate_ciphers[i] = TFHEpp::tlweSymInt32Encrypt<Lvl2>(
+        row_data.orderdate().value, Lvl2::α,
+        pow(2., row_data.orderdate().scale_bits<Lvl2>()), sk.key.get<Lvl2>());
+    commitdate_ciphers[i] = TFHEpp::tlweSymInt32Encrypt<Lvl2>(
+        row_data.commitdate().value, Lvl2::α,
+        pow(2., row_data.commitdate().scale_bits<Lvl2>()), sk.key.get<Lvl2>());
+    receiptdate_ciphers[i] = TFHEpp::tlweSymInt32Encrypt<Lvl2>(
+        row_data.receiptdate().value, Lvl2::α,
+        pow(2., row_data.receiptdate().scale_bits<Lvl2>()), sk.key.get<Lvl2>());
+    orderpriority_ciphers[i] = TFHEpp::tlweSymInt32Encrypt<Lvl1>(
+        row_data.orderpriority().value, Lvl1::α,
+        pow(2., row_data.orderpriority().scale_bits<Lvl1>()),
+        sk.key.get<Lvl1>());
   }
 
   // Encrypt Predicate values
@@ -74,8 +84,13 @@ void predicate_evaluation(std::vector<std::vector<TLWELvl1>> &pred_cres,
 
   // check if the predicate is correct
   auto groupby_num = query_data.groupby_num();
-  // pred_ship[rows]
-  std::vector<uint32_t> pred_ship_res(rows, 0);
+  // pred_orderdate[rows]
+  std::vector<uint32_t> pred_orderdate1_res(rows, 0);
+  std::vector<uint32_t> pred_orderdate2_res(rows, 0);
+  // pred_exsits[rows]
+  std::vector<uint32_t> pred_exsits_res(rows, 0);
+  // pred_result
+  std::vector<uint32_t> pred_pred_res(rows, 0);
   // pred_group[rows][groupby_num]
   std::vector<std::vector<uint32_t>> pred_group_res(
       groupby_num, std::vector<uint32_t>(rows, 0));
@@ -85,69 +100,70 @@ void predicate_evaluation(std::vector<std::vector<TLWELvl1>> &pred_cres,
 
   // pred_part & pred_group
   for (size_t i = 0; i < rows; i++) {
-    auto ship_record = query_data.shipdate();
-    pred_ship_res[i] = !!(data[i].shipdate().value <= ship_record.value);
+    auto orderdate_low = query_data.orderdate1();
+    auto orderdate_up = query_data.orderdate2();
+    pred_orderdate1_res[i] =
+        !!(data[i].orderdate().value >= orderdate_low.value);
+    pred_orderdate2_res[i] = !!(data[i].orderdate().value < orderdate_up.value);
+    pred_exsits_res[i] =
+        !!((data[i].commitdate().value < data[i].receiptdate().value));
+    pred_pred_res[i] = !!(pred_orderdate1_res[i] & pred_orderdate2_res[i] &
+                          pred_exsits_res[i]);
     for (size_t j = 0; j < groupby_num; j++) {
       auto index = query_data.group_index(j);
-      pred_group_res[j][i] = (data[i].linestatus().value ==
-                              query_data.linestatus()[index[0]].value) &&
-                             (data[i].returnflag().value ==
-                              query_data.returnflag()[index[1]].value);
+      pred_group_res[j][i] = !!(data[i].orderpriority().value ==
+                                query_data.orderpriority()[index[0]].value);
     }
   }
+
   // pred_res
   for (size_t i = 0; i < groupby_num; i++) {
     for (size_t j = 0; j < rows; j++) {
-      pred_res[i][j] = pred_group_res[i][j] & pred_ship_res[j];
+      pred_res[i][j] = pred_group_res[i][j] & pred_pred_res[j];
     }
   }
 
   // Encrypt Predicates
-  std::vector<TLWELvl2> pred_cipher_ship(rows);
+  std::vector<TLWELvl2> pred_cipher_orderdate1(rows), pred_cipher_orderdate2(rows);
   // pred_cipher_group
-  std::vector<std::vector<TLWELvl1>> pred_cipher_linestatus;
-  std::vector<std::vector<TLWELvl1>> pred_cipher_returnflag;
+  std::vector<std::vector<TLWELvl1>> pred_cipher_orderpriority;
   // encrypt predicate part
-  auto cipher_ship = TFHEpp::tlweSymInt32Encrypt<Lvl2>(
-      query_data.shipdate().value, Lvl2::α,
-      pow(2., data[0].shipdate().scale_bits<Lvl2>()), sk.key.get<Lvl2>());
-  for (size_t i = 0; i < rows; i++) {
-    pred_cipher_ship[i] = cipher_ship;
-  }
+  auto pred_cipher_orderdate1_temp = TFHEpp::tlweSymInt32Encrypt<Lvl2>(
+      query_data.orderdate1().value, Lvl2::α,
+      pow(2., data[0].orderdate().scale_bits<Lvl2>()), sk.key.get<Lvl2>());
+  for (size_t i = 0; i < rows; i++)
+    pred_cipher_orderdate1[i] = pred_cipher_orderdate1_temp;
+
+  auto pred_cipher_orderdate2_temp = TFHEpp::tlweSymInt32Encrypt<Lvl2>(
+      query_data.orderdate2().value, Lvl2::α,
+      pow(2., data[0].orderdate().scale_bits<Lvl2>()), sk.key.get<Lvl2>());
+  for (size_t i = 0; i < rows; i++)
+    pred_cipher_orderdate2[i] = pred_cipher_orderdate2_temp;
+
   // encrypt group by part
-  double linestatus_scale = pow(2., data[0].linestatus().scale_bits<Lvl1>());
-  auto linestatus_group = query_data.linestatus();
-  pred_cipher_linestatus.resize(linestatus_group.size());
-  for (size_t i = 0; i < linestatus_group.size(); i++) {
-    auto temp = TFHEpp::tlweSymInt32Encrypt<Lvl1>(linestatus_group[i].value, Lvl1::α,
-                                          linestatus_scale, sk.key.get<Lvl1>());
-    pred_cipher_linestatus[i].resize(rows);
+  double orderpriority_scale =
+      pow(2., data[0].orderpriority().scale_bits<Lvl1>());
+  auto orderpriority_group = query_data.orderpriority();
+  pred_cipher_orderpriority.resize(orderpriority_group.size());
+  for (size_t i = 0; i < orderpriority_group.size(); i++) {
+    auto pred_cipher_orderpriority_temp = TFHEpp::tlweSymInt32Encrypt<Lvl1>(
+        orderpriority_group[i].value, Lvl1::α, orderpriority_scale,
+        sk.key.get<Lvl1>());
     for (size_t j = 0; j < rows; j++)
-      pred_cipher_linestatus[i][j] = temp;
-  }
-  double returnflag_scale = pow(2., data[0].returnflag().scale_bits<Lvl1>());
-  auto returnflag_group = query_data.returnflag();
-  pred_cipher_returnflag.resize(returnflag_group.size());
-  for (size_t i = 0; i < returnflag_group.size(); i++) {
-    auto temp = TFHEpp::tlweSymInt32Encrypt<Lvl1>(returnflag_group[i].value, Lvl1::α,
-                                          returnflag_scale, sk.key.get<Lvl1>());
-    pred_cipher_returnflag[i].resize(rows);
-    for (size_t j = 0; j < rows; j++)
-      pred_cipher_returnflag[i][j] = temp;
+      pred_cipher_orderpriority[i].push_back(pred_cipher_orderpriority_temp);
   }
 
   // Predicate Evaluation
   std::cout << "Start Predicate Evaluation..." << std::endl;
-  std::vector<TLWELvl1> pred_ship_cres(rows);
-  auto ship_bits = data[0].shipdate().bits;
-  std::vector<std::vector<TLWELvl1>> pred_group_cres1(
-      groupby_num, std::vector<TLWELvl1>(rows));
-  std::vector<std::vector<TLWELvl1>> pred_group_cres2(
-      groupby_num, std::vector<TLWELvl1>(rows));
+  std::vector<TLWELvl1> pred_orderdate1_cres(rows), pred_orderdate2_cres(rows);
+  std::vector<TLWELvl1> pred_exsits_cres(rows);
+  std::vector<TLWELvl1> pred_pred_cres(rows);
+  auto orderdate_bits = data[0].orderdate().bits;
+  auto exsits_bits = data[0].commitdate().bits;
+  assert(data[0].commitdate().bits == data[0].receiptdate().bits);
   std::vector<std::vector<TLWELvl1>> pred_group_cres(
       groupby_num, std::vector<TLWELvl1>(rows));
-  auto linestatus_bits = data[0].linestatus().bits;
-  auto returnflag_bits = data[0].returnflag().bits;
+  auto orderpriority_bits = data[0].orderpriority().bits;
 
   Pointer<BootstrappingData<Lvl02>> pt_bs_data(rows);
   auto &pt_bs_data_lvl1 = pt_bs_data.template safe_cast<BootstrappingData<Lvl01>>();
@@ -161,24 +177,32 @@ void predicate_evaluation(std::vector<std::vector<TLWELvl1>> &pred_cres,
 
   filter_time = 0;
 
-  HomComp<Lvl02, LE, LOGIC>(ctx, pt_bs_data, pt_tlwe_data,
-      pred_ship_cres.data(), ship_ciphers.data(), pred_cipher_ship.data(),
-      ship_bits, rows, filter_time);
+  HomComp<Lvl02, GE, LOGIC>(ctx, pt_bs_data, pt_tlwe_data,
+      pred_orderdate1_cres.data(), orderdate_ciphers.data(), pred_cipher_orderdate1.data(),
+      orderdate_bits, rows, filter_time);
+  HomComp<Lvl02, LT, LOGIC>(ctx, pt_bs_data, pt_tlwe_data,
+      pred_orderdate2_cres.data(), orderdate_ciphers.data(), pred_cipher_orderdate2.data(),
+      orderdate_bits, rows, filter_time);
+  HomComp<Lvl02, LT, LOGIC>(ctx, pt_bs_data, pt_tlwe_data,
+      pred_exsits_cres.data(), commitdate_ciphers.data(), receiptdate_ciphers.data(),
+      exsits_bits, rows, filter_time);
+
+  HomAND<LOGIC>(ctx, pt_bs_data_lvl1, pt_tlwe_data_lvl1,
+      pred_pred_cres.data(), pred_orderdate1_cres.data(), pred_orderdate2_cres.data(),
+      rows, filter_time);
+  HomAND<LOGIC>(ctx, pt_bs_data_lvl1, pt_tlwe_data_lvl1,
+      pred_pred_cres.data(), pred_pred_cres.data(), pred_exsits_cres.data(),
+      rows, filter_time);
 
   for (size_t j = 0; j < groupby_num; j++) {
     auto index = query_data.group_index(j);
-    HomComp<Lvl01, EQ, LOGIC>(ctx, pt_bs_data_lvl1, pt_tlwe_data_lvl1,
-        pred_group_cres1[j].data(), pred_cipher_linestatus[index[0]].data(), linestatus_ciphers.data(),
-        linestatus_bits, rows, filter_time);
-    HomComp<Lvl01, EQ, LOGIC>(ctx, pt_bs_data_lvl1, pt_tlwe_data_lvl1,
-        pred_group_cres2[j].data(), pred_cipher_returnflag[index[1]].data(), returnflag_ciphers.data(),
-        returnflag_bits, rows, filter_time);
 
-    HomAND<LOGIC>(ctx, pt_bs_data_lvl1, pt_tlwe_data_lvl1,
-        pred_group_cres[j].data(), pred_group_cres1[j].data(), pred_group_cres2[j].data(),
-        rows, filter_time);
+    HomComp<Lvl01, EQ, LOGIC>(ctx, pt_bs_data_lvl1, pt_tlwe_data_lvl1,
+        pred_group_cres[j].data(), pred_cipher_orderpriority[index[0]].data(), orderpriority_ciphers.data(),
+        orderpriority_bits, rows, filter_time);
+
     HomAND<ARITHMETIC>(ctx, pt_bs_data_lvl1, pt_tlwe_data_lvl1,
-        pred_cres[j].data(), pred_group_cres[j].data(), pred_ship_cres.data(),
+        pred_cres[j].data(), pred_group_cres[j].data(), pred_pred_cres.data(),
         rows, filter_time);
   }
 
@@ -186,23 +210,24 @@ void predicate_evaluation(std::vector<std::vector<TLWELvl1>> &pred_cres,
   if (!NOCHECK) {
     std::vector<std::vector<uint32_t>> pred_cres_de(groupby_num,
                                                     std::vector<uint32_t>(rows));
-    std::vector<uint32_t> pred_ship_cres_de(rows);
-    std::vector<std::vector<uint32_t>> pred_group_cres1_de(
-        groupby_num, std::vector<uint32_t>(rows));
-    std::vector<std::vector<uint32_t>> pred_group_cres2_de(
-        groupby_num, std::vector<uint32_t>(rows));
+    std::vector<uint32_t> pred_orderdate1_cres_de(rows),
+        pred_orderdate2_cres_de(rows);
+    std::vector<uint32_t> pred_exsits_cres_de(rows);
+    std::vector<uint32_t> pred_pred_cres_de(rows);
     std::vector<std::vector<uint32_t>> pred_group_cres_de(
         groupby_num, std::vector<uint32_t>(rows));
     for (size_t i = 0; i < rows; i++) {
-      pred_ship_cres_de[i] =
-          TFHEpp::tlweSymDecrypt<Lvl1>(pred_ship_cres[i], sk.key.lvl1);
+      pred_orderdate1_cres_de[i] =
+          TFHEpp::tlweSymDecrypt<Lvl1>(pred_orderdate1_cres[i], sk.key.lvl1);
+      pred_orderdate2_cres_de[i] =
+          TFHEpp::tlweSymDecrypt<Lvl1>(pred_orderdate2_cres[i], sk.key.lvl1);
+      pred_exsits_cres_de[i] =
+          TFHEpp::tlweSymDecrypt<Lvl1>(pred_exsits_cres[i], sk.key.lvl1);
+      pred_pred_cres_de[i] =
+          TFHEpp::tlweSymDecrypt<Lvl1>(pred_pred_cres[i], sk.key.lvl1);
       for (size_t j = 0; j < groupby_num; j++) {
         pred_cres_de[j][i] = TFHEpp::tlweSymInt32Decrypt<Lvl1>(
             pred_cres[j][i], pow(2., 31), sk.key.get<Lvl1>());
-        pred_group_cres1_de[j][i] =
-            TFHEpp::tlweSymDecrypt<Lvl1>(pred_group_cres1[j][i], sk.key.lvl1);
-        pred_group_cres2_de[j][i] =
-            TFHEpp::tlweSymDecrypt<Lvl1>(pred_group_cres2[j][i], sk.key.lvl1);
         pred_group_cres_de[j][i] =
             TFHEpp::tlweSymDecrypt<Lvl1>(pred_group_cres[j][i], sk.key.lvl1);
       }
@@ -226,17 +251,14 @@ void predicate_evaluation(std::vector<std::vector<TLWELvl1>> &pred_cres,
 
     std::cout << "Predicate Error: " << error_time << std::endl;
   }
-
   std::cout << "Filter Time : " << filter_time << "ms" << std::endl;
 }
 
 void predicate_evaluation_cache(std::vector<std::vector<TLWELvl1>> &pred_cres,
                           std::vector<std::vector<uint32_t>> &pred_res,
                           std::vector<DataRecord> &data,
-                          QueryRequest &query_data,
-                          TFHESecretKey &sk,
-                          TFHEEvalKey &ek,
-                          CacheManager<Lvl1> &cm,
+                          QueryRequest &query_data, TFHESecretKey &sk,
+                          TFHEEvalKey &ek, CacheManager<Lvl1> &cm,
                           std::vector<std::vector<CacheFilter>> &filters,
                           std::vector<std::string> &filters_name,
                           std::vector<CacheMetadata<Lvl1::T>> &metas,
@@ -257,19 +279,24 @@ void predicate_evaluation_cache(std::vector<std::vector<TLWELvl1>> &pred_cres,
 
   // Encrypt database
   std::cout << "Encrypting Database..." << std::endl;
-  std::vector<TLWELvl1> returnflag_ciphers(rows), linestatus_ciphers(rows);
-  std::vector<TLWELvl2> ship_ciphers(rows);
+  std::vector<TLWELvl2> orderdate_ciphers(rows), commitdate_ciphers(rows),
+      receiptdate_ciphers(rows);
+  std::vector<TLWELvl1> orderpriority_ciphers(rows);
   for (size_t i = 0; i < rows; i++) {
     auto row_data = data[i];
-    returnflag_ciphers[i] = TFHEpp::tlweSymInt32Encrypt<Lvl1>(
-        row_data.returnflag().value, Lvl1::α,
-        pow(2., row_data.returnflag().scale_bits<Lvl1>()), sk.key.get<Lvl1>());
-    linestatus_ciphers[i] = TFHEpp::tlweSymInt32Encrypt<Lvl1>(
-        row_data.linestatus().value, Lvl1::α,
-        pow(2., row_data.linestatus().scale_bits<Lvl1>()), sk.key.get<Lvl1>());
-    ship_ciphers[i] = TFHEpp::tlweSymInt32Encrypt<Lvl2>(
-        row_data.shipdate().value, Lvl2::α,
-        pow(2., row_data.shipdate().scale_bits<Lvl2>()), sk.key.get<Lvl2>());
+    orderdate_ciphers[i] = TFHEpp::tlweSymInt32Encrypt<Lvl2>(
+        row_data.orderdate().value, Lvl2::α,
+        pow(2., row_data.orderdate().scale_bits<Lvl2>()), sk.key.get<Lvl2>());
+    commitdate_ciphers[i] = TFHEpp::tlweSymInt32Encrypt<Lvl2>(
+        row_data.commitdate().value, Lvl2::α,
+        pow(2., row_data.commitdate().scale_bits<Lvl2>()), sk.key.get<Lvl2>());
+    receiptdate_ciphers[i] = TFHEpp::tlweSymInt32Encrypt<Lvl2>(
+        row_data.receiptdate().value, Lvl2::α,
+        pow(2., row_data.receiptdate().scale_bits<Lvl2>()), sk.key.get<Lvl2>());
+    orderpriority_ciphers[i] = TFHEpp::tlweSymInt32Encrypt<Lvl1>(
+        row_data.orderpriority().value, Lvl1::α,
+        pow(2., row_data.orderpriority().scale_bits<Lvl1>()),
+        sk.key.get<Lvl1>());
   }
 
   // Encrypt Predicate values
@@ -277,9 +304,14 @@ void predicate_evaluation_cache(std::vector<std::vector<TLWELvl1>> &pred_cres,
 
   // check if the predicate is correct
   auto groupby_num = query_data.groupby_num();
-  // pred_ship[rows]
-  std::vector<uint32_t> pred_ship_res(rows, 0);
-  // pred_group[rows][groupby_num]
+  // pred_orderdate[rows]
+  std::vector<uint32_t> pred_orderdate1_res(rows, 0);
+  std::vector<uint32_t> pred_orderdate2_res(rows, 0);
+  // pred_exsits[rows]
+  std::vector<uint32_t> pred_exsits_res(rows, 0);
+  // pred_result
+  std::vector<uint32_t> pred_pred_res(rows, 0);
+  // pred_group[groupby_num][rows]
   std::vector<std::vector<uint32_t>> pred_group_res(
       groupby_num, std::vector<uint32_t>(rows, 0));
   // pred_res[groupby_num][rows]
@@ -288,87 +320,86 @@ void predicate_evaluation_cache(std::vector<std::vector<TLWELvl1>> &pred_cres,
 
   // pred_part & pred_group
   for (size_t i = 0; i < rows; i++) {
-    auto ship_record = query_data.shipdate();
-    pred_ship_res[i] = !!(data[i].shipdate().value <= ship_record.value);
+    auto orderdate_low = query_data.orderdate1();
+    auto orderdate_up = query_data.orderdate2();
+    pred_orderdate1_res[i] =
+        !!(data[i].orderdate().value >= orderdate_low.value);
+    pred_orderdate2_res[i] = !!(data[i].orderdate().value < orderdate_up.value);
+    pred_exsits_res[i] =
+        !!((data[i].commitdate().value < data[i].receiptdate().value));
+    pred_pred_res[i] = !!(pred_orderdate1_res[i] & pred_orderdate2_res[i] &
+                          pred_exsits_res[i]);
     for (size_t j = 0; j < groupby_num; j++) {
       auto index = query_data.group_index(j);
-      pred_group_res[j][i] = (data[i].linestatus().value ==
-                              query_data.linestatus()[index[0]].value) &&
-                             (data[i].returnflag().value ==
-                              query_data.returnflag()[index[1]].value);
+      pred_group_res[j][i] = !!(data[i].orderpriority().value ==
+                                query_data.orderpriority()[index[0]].value);
     }
   }
+
   // pred_res
   for (size_t i = 0; i < groupby_num; i++) {
     for (size_t j = 0; j < rows; j++) {
-      pred_res[i][j] = pred_group_res[i][j] & pred_ship_res[j];
+      pred_res[i][j] = pred_group_res[i][j] & pred_pred_res[j];
     }
   }
 
-  std::vector<Lvl1::T> data_shipdate;
+  std::vector<Lvl1::T> data_orderdate;
   // ==== generate cache filters
-  std::transform(data.begin(), data.end(), std::back_inserter(data_shipdate),
-                 [](DataRecord &item) { return item.shipdate().value; });
-  cm.generate(filters_name[0], data_shipdate, metas[0]);
+  std::transform(data.begin(), data.end(), std::back_inserter(data_orderdate),
+                 [](DataRecord &item) { return item.orderdate().value; });
+  cm.generate(filters_name[0], data_orderdate, metas[0]);
+  cm.generate(filters_name[1], data_orderdate, metas[1]);
+  cm.generate(filters_name[2], pred_exsits_res, metas[2]);
 
   size_t i = 0;
-  std::vector<Lvl1::T> data_linestatus, data_returnflag;
-  std::transform(data.begin(), data.end(), std::back_inserter(data_linestatus),
-                 [](DataRecord &item) { return item.linestatus().value; });
-  std::transform(data.begin(), data.end(), std::back_inserter(data_returnflag),
-                 [](DataRecord &item) { return item.returnflag().value; });
+  std::vector<Lvl1::T> data_orderpriority;
+  std::transform(data.begin(), data.end(), std::back_inserter(data_orderpriority),
+                 [](DataRecord &item) { return item.orderpriority().value; });
   for (size_t j = 0; j < gfilters[0].size(); ++i, ++j)
-    cm.generate(gfilters_name[i], data_linestatus, gmetas[i]);
-  for (size_t j = 0; j < gfilters[1].size(); ++i, ++j)
-    cm.generate(gfilters_name[i], data_returnflag, gmetas[i]);
+    cm.generate(gfilters_name[i], data_orderpriority, gmetas[i]);
   // ==== end of cache filter generation
 
   // Encrypt Predicates
-  std::vector<TLWELvl2> pred_cipher_ship(rows);
+  std::vector<TLWELvl2> pred_cipher_orderdate1(rows), pred_cipher_orderdate2(rows);
   // pred_cipher_group
-  std::vector<std::vector<TLWELvl1>> pred_cipher_linestatus;
-  std::vector<std::vector<TLWELvl1>> pred_cipher_returnflag;
+  std::vector<std::vector<TLWELvl1>> pred_cipher_orderpriority;
   // encrypt predicate part
-  auto cipher_ship = TFHEpp::tlweSymInt32Encrypt<Lvl2>(
-      query_data.shipdate().value, Lvl2::α,
-      pow(2., data[0].shipdate().scale_bits<Lvl2>()), sk.key.get<Lvl2>());
-  for (size_t i = 0; i < rows; i++) {
-    pred_cipher_ship[i] = cipher_ship;
-  }
+  auto pred_cipher_orderdate1_temp = TFHEpp::tlweSymInt32Encrypt<Lvl2>(
+      query_data.orderdate1().value, Lvl2::α,
+      pow(2., data[0].orderdate().scale_bits<Lvl2>()), sk.key.get<Lvl2>());
+  for (size_t i = 0; i < rows; i++)
+    pred_cipher_orderdate1[i] = pred_cipher_orderdate1_temp;
+
+  auto pred_cipher_orderdate2_temp = TFHEpp::tlweSymInt32Encrypt<Lvl2>(
+      query_data.orderdate2().value, Lvl2::α,
+      pow(2., data[0].orderdate().scale_bits<Lvl2>()), sk.key.get<Lvl2>());
+  for (size_t i = 0; i < rows; i++)
+    pred_cipher_orderdate2[i] = pred_cipher_orderdate2_temp;
+
   // encrypt group by part
-  double linestatus_scale = pow(2., data[0].linestatus().scale_bits<Lvl1>());
-  auto linestatus_group = query_data.linestatus();
-  pred_cipher_linestatus.resize(linestatus_group.size());
-  for (size_t i = 0; i < linestatus_group.size(); i++) {
-    auto temp = TFHEpp::tlweSymInt32Encrypt<Lvl1>(linestatus_group[i].value, Lvl1::α,
-                                          linestatus_scale, sk.key.get<Lvl1>());
-    pred_cipher_linestatus[i].resize(rows);
+  double orderpriority_scale =
+      pow(2., data[0].orderpriority().scale_bits<Lvl1>());
+  auto orderpriority_group = query_data.orderpriority();
+  pred_cipher_orderpriority.resize(orderpriority_group.size());
+  for (size_t i = 0; i < orderpriority_group.size(); i++) {
+    auto pred_cipher_orderpriority_temp = TFHEpp::tlweSymInt32Encrypt<Lvl1>(
+        orderpriority_group[i].value, Lvl1::α, orderpriority_scale,
+        sk.key.get<Lvl1>());
     for (size_t j = 0; j < rows; j++)
-      pred_cipher_linestatus[i][j] = temp;
-  }
-  double returnflag_scale = pow(2., data[0].returnflag().scale_bits<Lvl1>());
-  auto returnflag_group = query_data.returnflag();
-  pred_cipher_returnflag.resize(returnflag_group.size());
-  for (size_t i = 0; i < returnflag_group.size(); i++) {
-    auto temp = TFHEpp::tlweSymInt32Encrypt<Lvl1>(returnflag_group[i].value, Lvl1::α,
-                                          returnflag_scale, sk.key.get<Lvl1>());
-    pred_cipher_returnflag[i].resize(rows);
-    for (size_t j = 0; j < rows; j++)
-      pred_cipher_returnflag[i][j] = temp;
+      pred_cipher_orderpriority[i].push_back(pred_cipher_orderpriority_temp);
   }
 
   // Predicate Evaluation
   std::cout << "Start Predicate Evaluation..." << std::endl;
-  std::vector<TLWELvl1> pred_ship_cres(rows);
-  auto ship_bits = data[0].shipdate().bits;
-  std::vector<std::vector<TLWELvl1>> pred_group_cres1(
-      groupby_num, std::vector<TLWELvl1>(rows));
-  std::vector<std::vector<TLWELvl1>> pred_group_cres2(
-      groupby_num, std::vector<TLWELvl1>(rows));
+  std::vector<TLWELvl1> pred_orderdate1_cres(rows), pred_orderdate2_cres(rows);
+  std::vector<TLWELvl1> pred_exsits_cres(rows);
+  std::vector<TLWELvl1> pred_pred_cres(rows);
+  auto orderdate_bits = data[0].orderdate().bits;
+  auto exsits_bits = data[0].commitdate().bits;
+  assert(data[0].commitdate().bits == data[0].receiptdate().bits);
   std::vector<std::vector<TLWELvl1>> pred_group_cres(
       groupby_num, std::vector<TLWELvl1>(rows));
-  auto linestatus_bits = data[0].linestatus().bits;
-  auto returnflag_bits = data[0].returnflag().bits;
+  auto orderpriority_bits = data[0].orderpriority().bits;
 
   // ==== find cache filters
   // predicates
@@ -406,58 +437,81 @@ void predicate_evaluation_cache(std::vector<std::vector<TLWELvl1>> &pred_cres,
   filter_time = 0;
   tfhe_correction_time = 0;
 
-  HomFastComp<Lvl02, LE, LOGIC>(ctx, pt_bs_data, pt_tlwe_data,
-      pred_ship_cres.data(), ship_ciphers.data(), pred_cipher_ship.data(),
-      ship_bits, metas[0].get_density(), rows, filter_time);
+  // orderdate1
+  HomFastComp<Lvl02, GE, LOGIC>(ctx, pt_bs_data, pt_tlwe_data,
+      pred_orderdate1_cres.data(), orderdate_ciphers.data(), pred_cipher_orderdate1.data(),
+      orderdate_bits, metas[0].get_density(), rows, filter_time);
+  tfhe_correction(ctx, filters[0], pt_bs_data_lvl1, pt_tlwe_data_lvl1,
+      pred_orderdate1_cres.data(), rows, tfhe_correction_time);
 
-  tfhe_correction(ctx, filters[0], pt_bs_data_lvl1, pt_tlwe_data_lvl1, pred_ship_cres.data(),
-      rows, tfhe_correction_time);
+  // orderdate2
+  HomFastComp<Lvl02, LT, LOGIC>(ctx, pt_bs_data, pt_tlwe_data,
+      pred_orderdate2_cres.data(), orderdate_ciphers.data(), pred_cipher_orderdate2.data(),
+      orderdate_bits, metas[1].get_density(), rows, filter_time);
+  tfhe_correction(ctx, filters[1], pt_bs_data_lvl1, pt_tlwe_data_lvl1,
+      pred_orderdate2_cres.data(), rows, tfhe_correction_time);
 
+  // exsits (hit or not hit)
+  bool exsits_operated = !!metas[2].get_density();
+  HomFastComp<Lvl02, LT, LOGIC>(ctx, pt_bs_data, pt_tlwe_data,
+      pred_exsits_cres.data(), commitdate_ciphers.data(), receiptdate_ciphers.data(),
+      exsits_bits, metas[2].get_density(), rows, filter_time);
+
+  exsits_operated = tfhe_correction(
+      ctx, filters[2], pt_bs_data_lvl1, pt_tlwe_data_lvl1, pred_exsits_cres.data(), rows, tfhe_correction_time)
+    || exsits_operated;
+
+  HomAND<LOGIC>(ctx, pt_bs_data_lvl1, pt_tlwe_data_lvl1,
+      pred_pred_cres.data(), pred_orderdate1_cres.data(), pred_orderdate2_cres.data(),
+      rows, filter_time);
+
+  HomAND<LOGIC>(ctx, pt_bs_data_lvl1, pt_tlwe_data_lvl1,
+      pred_pred_cres.data(), pred_pred_cres.data(), pred_exsits_cres.data(),
+      rows, filter_time);
+
+  // group by
   std::vector<size_t> indices(gfilters.size(), 0);
   for (size_t j = 0; j < groupby_num; j++) {
     auto index = query_data.group_index(j);
 
-    // group by - linestatus
-    auto linestatus_filters = gfilters[0][indices[0]];
-    auto linestatus_metas = gmetas[indices[0]];
-    bool operated_linestatus = !!linestatus_metas.get_density();
-
+    // group by - orderpriority
+    auto &group_filter = gfilters[0][indices[0]];
+    auto &group_meta = gmetas[indices[0]];
+    bool group_operated = !!group_meta.get_density();
     HomFastComp<Lvl01, EQ, LOGIC>(ctx, pt_bs_data_lvl1, pt_tlwe_data_lvl1,
-        pred_group_cres1[j].data(), pred_cipher_linestatus[index[0]].data(), linestatus_ciphers.data(),
-        linestatus_bits, linestatus_metas.get_density(), rows, filter_time);
-    operated_linestatus = tfhe_correction(
-        linestatus_filters, pt_tlwe_data_lvl1, pred_group_cres1[j].data(), rows, tfhe_correction_time)
-      || operated_linestatus;
+        pred_group_cres[j].data(), pred_cipher_orderpriority[index[0]].data(), orderpriority_ciphers.data(),
+        orderpriority_bits, group_meta.get_density(), rows, filter_time);
 
-    // group by - returnflag
-    auto base = gfilters[0].size();
-    auto returnflag_filters = gfilters[1][indices[1]];
-    auto returnflag_metas = gmetas[base + indices[1]];
-    bool operated_returnflag = !!returnflag_metas.get_density();
+    group_operated = tfhe_correction(
+        group_filter, pt_tlwe_data_lvl1, pred_group_cres[j].data(), rows, tfhe_correction_time)
+      || group_operated;
 
-    HomFastComp<Lvl01, EQ, LOGIC>(ctx, pt_bs_data_lvl1, pt_tlwe_data_lvl1,
-        pred_group_cres2[j].data(), pred_cipher_returnflag[index[1]].data(), returnflag_ciphers.data(),
-        returnflag_bits, returnflag_metas.get_density(), rows, filter_time);
-    operated_returnflag = tfhe_correction(
-        returnflag_filters, pt_tlwe_data_lvl1, pred_group_cres2[j].data(), rows, tfhe_correction_time)
-      || operated_returnflag;
-
-    if (operated_linestatus || operated_returnflag) {
-      if (operated_linestatus && operated_returnflag) {
+    // hit, but no operation
+    if (group_operated) {
         HomAND<LOGIC>(ctx, pt_bs_data_lvl1, pt_tlwe_data_lvl1,
-            pred_group_cres[j].data(), pred_group_cres1[j].data(), pred_group_cres2[j].data(),
+            pred_pred_cres.data(), pred_orderdate1_cres.data(), pred_orderdate2_cres.data(),
+            rows, filter_time);
+        if (exsits_operated)
+          HomAND<LOGIC>(ctx, pt_bs_data_lvl1, pt_tlwe_data_lvl1,
+              pred_pred_cres.data(), pred_pred_cres.data(), pred_exsits_cres.data(),
+              rows, filter_time);
+      HomAND<ARITHMETIC>(ctx, pt_bs_data_lvl1, pt_tlwe_data_lvl1,
+          pred_cres[j].data(), pred_group_cres[j].data(), pred_pred_cres.data(),
+          rows, filter_time);
+    } else {
+      if (exsits_operated) {
+        HomAND<LOGIC>(ctx, pt_bs_data_lvl1, pt_tlwe_data_lvl1,
+            pred_pred_cres.data(), pred_orderdate1_cres.data(), pred_orderdate2_cres.data(),
+            rows, filter_time);
+        HomAND<ARITHMETIC>(ctx, pt_bs_data_lvl1, pt_tlwe_data_lvl1,
+            pred_pred_cres.data(), pred_pred_cres.data(), pred_exsits_cres.data(),
             rows, filter_time);
       } else {
-        pred_group_cres[j] = operated_linestatus ? pred_group_cres1[j]
-                                                    : pred_group_cres2[j];
+        HomAND<ARITHMETIC>(ctx, pt_bs_data_lvl1, pt_tlwe_data_lvl1,
+            pred_pred_cres.data(), pred_orderdate1_cres.data(), pred_orderdate2_cres.data(),
+            rows, filter_time);
       }
-      HomAND<ARITHMETIC>(ctx, pt_bs_data_lvl1, pt_tlwe_data_lvl1,
-          pred_cres[j].data(), pred_group_cres[j].data(), pred_ship_cres.data(), rows, filter_time);
-    } else {
-      HomAND<ARITHMETIC>(ctx, pt_bs_data_lvl1, pt_tlwe_data_lvl1,
-          pred_cres[j].data(), pred_ship_cres.data(), pred_ship_cres.data(), rows, filter_time);
     }
-
     // Move to next
     for (size_t k = gfilters.size(); k-- > 0;) {
       if (++indices[k] < gfilters[k].size()) {
@@ -471,23 +525,24 @@ void predicate_evaluation_cache(std::vector<std::vector<TLWELvl1>> &pred_cres,
   if (!NOCHECK) {
     std::vector<std::vector<uint32_t>> pred_cres_de(groupby_num,
                                                     std::vector<uint32_t>(rows));
-    std::vector<uint32_t> pred_ship_cres_de(rows);
-    std::vector<std::vector<uint32_t>> pred_group_cres1_de(
-        groupby_num, std::vector<uint32_t>(rows));
-    std::vector<std::vector<uint32_t>> pred_group_cres2_de(
-        groupby_num, std::vector<uint32_t>(rows));
+    std::vector<uint32_t> pred_orderdate1_cres_de(rows),
+        pred_orderdate2_cres_de(rows);
+    std::vector<uint32_t> pred_exsits_cres_de(rows);
+    std::vector<uint32_t> pred_pred_cres_de(rows);
     std::vector<std::vector<uint32_t>> pred_group_cres_de(
         groupby_num, std::vector<uint32_t>(rows));
     for (size_t i = 0; i < rows; i++) {
-      pred_ship_cres_de[i] =
-          TFHEpp::tlweSymDecrypt<Lvl1>(pred_ship_cres[i], sk.key.lvl1);
+      pred_orderdate1_cres_de[i] =
+          TFHEpp::tlweSymDecrypt<Lvl1>(pred_orderdate1_cres[i], sk.key.lvl1);
+      pred_orderdate2_cres_de[i] =
+          TFHEpp::tlweSymDecrypt<Lvl1>(pred_orderdate2_cres[i], sk.key.lvl1);
+      pred_exsits_cres_de[i] =
+          TFHEpp::tlweSymDecrypt<Lvl1>(pred_exsits_cres[i], sk.key.lvl1);
+      pred_pred_cres_de[i] =
+          TFHEpp::tlweSymDecrypt<Lvl1>(pred_pred_cres[i], sk.key.lvl1);
       for (size_t j = 0; j < groupby_num; j++) {
         pred_cres_de[j][i] = TFHEpp::tlweSymInt32Decrypt<Lvl1>(
             pred_cres[j][i], pow(2., 31), sk.key.get<Lvl1>());
-        pred_group_cres1_de[j][i] =
-            TFHEpp::tlweSymDecrypt<Lvl1>(pred_group_cres1[j][i], sk.key.lvl1);
-        pred_group_cres2_de[j][i] =
-            TFHEpp::tlweSymDecrypt<Lvl1>(pred_group_cres2[j][i], sk.key.lvl1);
         pred_group_cres_de[j][i] =
             TFHEpp::tlweSymDecrypt<Lvl1>(pred_group_cres[j][i], sk.key.lvl1);
       }
@@ -520,7 +575,9 @@ void predicate_evaluation_cache(std::vector<std::vector<TLWELvl1>> &pred_cres,
 
 void aggregation(std::vector<PhantomCiphertext> &result,
                  std::vector<std::vector<uint32_t>> &pred_res,
-                 std::vector<DataRecord> &data, size_t rows, PhantomRLWE &rlwe,
+                 std::vector<DataRecord> &data,
+                 size_t rows,
+                 PhantomRLWE &rlwe,
                  double &aggregation_time) {
   std::cout << "Aggregation :" << std::endl;
   size_t groupby_num = result.size();
@@ -534,33 +591,15 @@ void aggregation(std::vector<PhantomCiphertext> &result,
 
   // Filter result * data
   // original data
-  std::vector<double> quantity_data(rows), extendedprice_data(rows),
-      extendedprice_discount_data(rows), discount_tax_data(rows),
-      discount_data(rows);
+  std::vector<double> count_data(rows);
   // packed ciphertext
-  PhantomCiphertext quantity_cipher, extendedprice_cipher,
-      extendedprice_discount_cipher, discount_tax_cipher, discount_cipher;
+  PhantomCiphertext count_cipher;
   // sum result ciphertext
-  std::vector<PhantomCiphertext> sum_qty(groupby_num),
-      sum_base_price(groupby_num), sum_disc_price(groupby_num),
-      sum_charge(groupby_num), sum_disc(groupby_num);
-  std::vector<DataPack> table = {
-      {quantity_data, quantity_cipher, sum_qty},
-      {extendedprice_data, extendedprice_cipher, sum_base_price},
-      {extendedprice_discount_data, extendedprice_discount_cipher,
-       sum_disc_price},
-      {discount_tax_data, discount_tax_cipher, sum_charge},
-      {discount_data, discount_cipher, sum_disc}};
+  std::vector<PhantomCiphertext> order_count(groupby_num);
+  std::vector<DataPack> table = {{count_data, count_cipher, order_count}};
 
   for (size_t i = 0; i < rows; i++) {
-    quantity_data[i] = data[i].quantity().value;
-    extendedprice_data[i] = data[i].extendedprice().value;
-    extendedprice_discount_data[i] =
-        data[i].extendedprice().value * (1 - data[i].discount().value);
-    discount_tax_data[i] = data[i].extendedprice().value *
-                           (1 - data[i].discount().value) *
-                           (1 + data[i].tax().value);
-    discount_data[i] = data[i].discount().value;
+    count_data[i] = 1.0;
   }
 
   // convert data to ciphertext
@@ -634,11 +673,12 @@ void query_evaluation(TFHESecretKey &sk, TFHEEvalKey &ek, size_t rows, std::vect
     // Generate database
   vector<DataRecord> data(rows);
   QueryRequest query_data;
-  int returnflag_size = 2, linestatus_size = 3;
+  int orderpriority_size = 3;
   for (size_t i = 0; i < rows; i++) {
-    data[i].init(returnflag_size, linestatus_size);
+    data[i].init(orderpriority_size);
   }
-  query_data.init(returnflag_size, linestatus_size);
+  query_data.init(orderpriority_size);
+
   PhantomRLWE rlwe(rows);
 
   if (!CACHE_ENABLED) {
@@ -659,25 +699,21 @@ void query_evaluation(TFHESecretKey &sk, TFHEEvalKey &ek, size_t rows, std::vect
   using T = Lvl1::T;
   CacheManager<Lvl1> cm(&sk, &ek, &rlwe, FAST_COMP);
 
-  std::vector<std::string> filters_name = {"shipdate"};
+  std::vector<std::string> filters_name = {"orderdate", "orderdate", "exsits"};
   std::vector<std::vector<CacheFilter>> filters(filters_name.size());
   std::vector<CacheMetadata<T>> metas = {
-      CacheMetadata<T>(CompLogic::LE, (T)query_data.shipdate().value)};
+      CacheMetadata<T>(CompLogic::GE, (T)query_data.orderdate1().value),
+      CacheMetadata<T>(CompLogic::LT, (T)query_data.orderdate2().value),
+      CacheMetadata<T>(CompLogic::NE, (T)0)};
 
   std::vector<std::string> gfilters_name;
-  std::vector<std::vector<CacheFilter>> gfilters(2);
+  std::vector<std::vector<CacheFilter>> gfilters(1);
+  gfilters[0] = std::vector<CacheFilter>(orderpriority_size);
   std::vector<CacheMetadata<T>> gmetas;
-  gfilters[0] = std::vector<CacheFilter>(linestatus_size);
-  for (size_t i = 0; i < linestatus_size; ++i) {
-    gfilters_name.push_back("linestatus");
+  for (size_t i = 0; i < orderpriority_size; ++i) {
+    gfilters_name.push_back("orderpriority");
     gmetas.push_back(CacheMetadata<T>(CompLogic::EQ,
-                                 (T)query_data.linestatus()[i].value));
-  };
-  gfilters[1] = std::vector<CacheFilter>(returnflag_size);
-  for (size_t i = 0; i < returnflag_size; ++i) {
-    gfilters_name.push_back("returnflag");
-    gmetas.push_back(CacheMetadata<T>(CompLogic::EQ,
-                                 (T)query_data.returnflag()[i].value));
+                                 (T)query_data.orderpriority()[i].value));
   };
 
   double filter_time, conversion_time, tfhe_correction_time, ckks_correction_time, aggregation_time;
@@ -689,17 +725,17 @@ void query_evaluation(TFHESecretKey &sk, TFHEEvalKey &ek, size_t rows, std::vect
       cm, filters, filters_name, metas, gfilters, gfilters_name, gmetas, rows, filter_time, tfhe_correction_time);
   rlwe.genLWE2RLWEGaloisKeys();
   conversion(results, pred_cres, pred_res, rlwe, sk, conversion_time, NOCHECK);
-  // phantom::util::global_pool()->Release_useless();
   rlwe.genGaloisKeys();
   filter_correction(results, pred_res, rlwe, filters, gfilters,
                   ckks_correction_time, NOCHECK);
   aggregation(results, pred_res, data, rows, rlwe, aggregation_time);
+
   record_e2e_time_cache(time, rows, filter_time, tfhe_correction_time, conversion_time, ckks_correction_time, aggregation_time);
 }
 
 int main(int argc, char** argv)
 {
-  argparse::ArgumentParser program("tpch_q1");
+  argparse::ArgumentParser program("tpch_q4");
 
   add_arguments(program);
 

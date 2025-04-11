@@ -1,7 +1,100 @@
 #pragma once
 
+#include <string>
+#include <fstream>
 #include "gate.cuh"
 #include "argparse.hpp"
+
+void add_arguments(argparse::ArgumentParser& program)
+{
+  program.add_argument("--nofastcomp")
+    .help("disable fastcomp")
+    .default_value(false)
+    .implicit_value(true);
+
+  program.add_argument("--nocache")
+    .help("disable cache")
+    .default_value(false)
+    .implicit_value(true);
+
+  program.add_argument("--check")
+    .help("check result")
+    .default_value(false)
+    .implicit_value(true);
+
+  program.add_argument("-o", "--output")
+    .help("output file")
+    .default_value(std::string(""));
+
+  program.add_argument("--rows")
+    .help("number of rows")
+    .nargs(1,10)
+    .scan<'i', int>();
+
+  program.add_argument("-d", "--device")
+    .help("device id")
+    .default_value(0)
+    .scan<'i', int>();
+}
+
+void output_result(std::string output, std::vector<std::vector<double>>& time, bool cache_enabled)
+{
+  std::string output_head = cache_enabled ?
+    "rows,fhc,phc,lwe_correct,rlwe_correct,packing,aggregation,end2end" :
+    "rows,filter,packing,aggregation,end2end";
+
+  if (output.empty()) {
+    std::cout << "--------------------------------" << std::endl;
+    std::cout << output_head << std::endl;
+    for (size_t i = 0; i < time.size(); i++) {
+      for (size_t j = 0; j < time[i].size(); j++) {
+        std::cout << time[i][j] << ",";
+      }
+      std::cout << std::endl;
+    }
+  }
+  else {
+    std::ofstream ofs(output);
+    ofs << output_head << std::endl;
+    for (size_t i = 0; i < time.size(); i++) {
+      for (size_t j = 0; j < time[i].size(); j++) {
+        ofs << time[i][j] << ",";
+      }
+      ofs << std::endl;
+    }
+  }
+}
+
+void record_e2e_time(std::vector<double>& time, size_t rows,
+                double filter_time, double conversion_time, double aggregation_time)
+{
+  std::cout << "End-to-End Time: "
+         << (filter_time + conversion_time + aggregation_time) / 1000 << " s"
+         << std::endl;
+
+    time.push_back(rows);
+    time.push_back(filter_time/1000);
+    time.push_back(conversion_time/1000);
+    time.push_back(aggregation_time/1000);
+    time.push_back((filter_time+conversion_time+aggregation_time)/1000);
+}
+
+void record_e2e_time_cache(std::vector<double>& time, size_t rows,
+                double filter_time, double tfhe_correction_time, double conversion_time,
+                double ckks_correction_time, double aggregation_time)
+{
+  std::cout << "End-to-End Time: "
+       << (filter_time + tfhe_correction_time + conversion_time + ckks_correction_time + aggregation_time) / 1000 << " s"
+       << std::endl;
+  time.push_back(rows);
+  time.push_back((filter_time+tfhe_correction_time+ckks_correction_time)/1000);
+  time.push_back(filter_time/1000);
+  time.push_back(tfhe_correction_time/1000);
+  time.push_back(ckks_correction_time/1000);
+  time.push_back(conversion_time/1000);
+  time.push_back(aggregation_time/1000);
+  time.push_back((filter_time+tfhe_correction_time+ckks_correction_time+conversion_time+aggregation_time)/1000);
+}
 
 uint64_t generate_date(uint64_t down, uint64_t up)
 {

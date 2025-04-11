@@ -23,8 +23,8 @@ add_subdirectory(thirdparty/phantom-fhe)
 add_subdirectory(thirdparty/TFHEpp)
 add_subdirectory(cuTFHEpp)
 
-# set(CMAKE_CUDA_FLAGS "-g -G -std=c++20 -maxrregcount=64 -arch=sm_80 -ccbin g++ -expt-relaxed-constexpr")
-set(CMAKE_CUDA_FLAGS "-O2 -std=c++20 -arch=sm_80 -ccbin g++ -expt-relaxed-constexpr")
+# set(CMAKE_CUDA_FLAGS "-g -G -std=c++20 -maxrregcount=64 -ccbin g++ -expt-relaxed-constexpr")
+set(CMAKE_CUDA_FLAGS "-O2 -std=c++20 -ccbin g++ -expt-relaxed-constexpr")
 
 set(opera_sources "")
 add_subdirectory(src)
