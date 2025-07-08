@@ -97,6 +97,22 @@ TPC-H Query 6 with cache (fast comp):
 ./build/bin/tpch_q6 --rows 256 1024 4096 16384 --output opera.csv
 ```
 
+## Cite
+If you use `Opera` for your academic work, you can cite the following paper:
+
+```bibtex
+@inproceedings{Opera,
+ author      = {Hu, Qi and Chen, Wei and Shen, Tianxiang and Yao, Xin and Zhang, Nicholas and Cui, Heming and Yiu, Siu-Ming},
+ booktitle   = {2025 IEEE Symposium on Security and Privacy (SP)}, 
+ title       = {Opera: Achieving Secure and High-Performance OLAP with Parallelized Homomorphic Comparisons}, 
+ year        = {2025},
+ volume      = {},
+ number      = {},
+ pages       = {2360-2377},
+ doi         = {10.1109/SP61157.2025.00173}
+}
+```
+
 ## License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
